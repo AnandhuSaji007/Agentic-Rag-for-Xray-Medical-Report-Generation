@@ -1,0 +1,180 @@
+import os
+import torch
+import faiss
+import numpy as np
+import pandas as pd
+from PIL import Image
+from torchvision import transforms, models
+import torch.nn as nn
+from transformers import T5ForConditionalGeneration, BertTokenizer
+from sentence_transformers import SentenceTransformer, util
+from langchain.llms import HuggingFaceHub
+from tqdm import tqdm
+
+
+# -----------------------------------------
+# 1. Define the R2Gen Model
+# -----------------------------------------
+class R2GenModel(torch.nn.Module):
+    def __init__(self, model_name='t5-small', device='cuda', dropout_prob=0.1):
+        super(R2GenModel, self).__init__()
+        self.tokenizer = BertTokenizer.from_pretrained('bert-base-uncased')
+        self.model = T5ForConditionalGeneration.from_pretrained(model_name).to(device)
+        self.device = device
+
+        # Visual extractor
+        self.visual_extractor = models.resnet101(pretrained=True).to(device)
+        self.visual_extractor.fc = nn.Linear(self.visual_extractor.fc.in_features, self.model.config.d_model).to(device)
+
+        self.dropout = nn.Dropout(dropout_prob)
+
+    def forward(self, input_ids, attention_mask, images, labels=None):
+        visual_features = self.extract_visual_features(images)
+        visual_features = self.dropout(visual_features)
+        if labels is not None:
+            return self.model(input_ids=input_ids, attention_mask=attention_mask,
+                              encoder_outputs=(visual_features,), labels=labels)
+        else:
+            return self.model.generate(input_ids=input_ids, attention_mask=attention_mask,
+                                       encoder_outputs=(visual_features,))
+
+    def extract_visual_features(self, images):
+        images = images.to(self.device)
+        visual_features = self.visual_extractor(images)
+        visual_features = visual_features.unsqueeze(1)
+        batch_size, dim = visual_features.size(0), visual_features.size(2)
+        visual_features = visual_features.expand(batch_size, 512, dim)
+        return visual_features
+
+    def generate_caption(self, input_ids, images, max_length=50):
+        visual_features = self.extract_visual_features(images)
+        generated_ids = self.model.generate(input_ids=input_ids,
+                                            encoder_outputs=(visual_features,),
+                                            max_length=max_length,
+                                            num_beams=1)
+        generated_texts = [self.tokenizer.decode(g, skip_special_tokens=True) for g in generated_ids]
+        return generated_texts
+
+
+# -----------------------------------------
+# 2. Setup
+# -----------------------------------------
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+r2gen_model = R2GenModel(model_name='t5-small', device=device)
+r2gen_model.load_state_dict(torch.load('r2gen_model_Bert.pth', map_location=device))
+r2gen_model.eval()
+
+# Image transform
+image_transform = transforms.Compose([
+    transforms.Resize((224, 224)),
+    transforms.ToTensor(),
+    transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
+])
+
+# Load FAISS index and metadata
+faiss_index = faiss.read_index("faiss_index.bin")
+metadata = np.load("metadata.npy", allow_pickle=True)
+text_embedder = SentenceTransformer('all-MiniLM-L6-v2')
+metadata_embeddings = text_embedder.encode(list(metadata), convert_to_tensor=True)
+
+# Define FAISS-compatible visual feature extractor
+def faiss_visual_extractor(image_tensor):
+    with torch.no_grad():
+        features = r2gen_model.visual_extractor(image_tensor).squeeze().cpu().numpy().reshape(1, -1)
+    return torch.tensor(features)
+
+# -----------------------------------------
+# 3. Retriever Agent
+# -----------------------------------------
+def retriever_agent(image_path):
+    image = Image.open(image_path).convert('RGB')
+    image_tensor = image_transform(image).unsqueeze(0).to(device)
+
+    prompt = "generate a detailed report by analysing the image: "
+    input_ids = r2gen_model.tokenizer.encode(prompt, return_tensors="pt", max_length=512, truncation=True, padding="max_length").to(device)
+    r2gen_text = r2gen_model.generate_caption(input_ids, image_tensor, max_length=50)[0]
+
+    # Visual retrieval
+    visual_feat = faiss_visual_extractor(image_tensor)
+    visual_feat_np = visual_feat.numpy()
+    distances, indices = faiss_index.search(visual_feat_np, k=1)
+    retrieved_visual_text = metadata[indices[0][0]]
+
+    # Text retrieval
+    generated_embedding = text_embedder.encode(r2gen_text, convert_to_tensor=True)
+    cosine_scores = util.cos_sim(generated_embedding, metadata_embeddings)[0]
+    top_result = torch.topk(cosine_scores, k=1)
+    retrieved_text = metadata[top_result.indices.item()]
+
+    # Combine
+    combined_scores = (cosine_scores.cpu().numpy() + (-distances[0])) / 2
+    best_index = np.argmax(combined_scores)
+    chosen_data = metadata[best_index]
+
+    return r2gen_text, chosen_data
+
+# -----------------------------------------
+# 4. Report Generation Agent
+# -----------------------------------------
+def report_generation_agent(r2gen_text, retrieved_data, HF_TOKEN):
+    llm = HuggingFaceHub(repo_id="HuggingFaceH4/zephyr-7b-beta",
+                         model_kwargs={"temperature": 0.7, "max_new_tokens": 512},
+                         huggingfacehub_api_token=HF_TOKEN)
+
+    prompt = f"""
+    You are a medical report generation AI. Given the following details:
+
+    1. **R2Gen generated text**: {r2gen_text}
+    2. **Retrieved metadata**: {retrieved_data}
+
+    Generate a detailed medical report by combining both sources. Avoid repetition.
+    """
+
+    final_report = llm(prompt)
+    return final_report
+
+# -----------------------------------------
+# 5. Main Pipeline
+# -----------------------------------------
+def main_pipeline(image_path, HF_TOKEN):
+    r2gen_text, retrieved_data = retriever_agent(image_path)
+    final_report = report_generation_agent(r2gen_text, retrieved_data, HF_TOKEN)
+    return final_report
+
+# -----------------------------------------
+# 6. Run on CSV
+# -----------------------------------------
+def process_csv(csv_path, image_folder, output_csv_path, HF_TOKEN):
+    df = pd.read_csv(csv_path)
+    results = []
+
+    for idx, row in tqdm(df.iterrows(), total=len(df)):
+        image_file = row['path_to_image']
+        report_text = row['Report']
+        image_path = os.path.join(image_folder, image_file)
+
+        try:
+            generated_report = main_pipeline(image_path, HF_TOKEN)
+        except Exception as e:
+            print(f"Error on {image_file}: {e}")
+            generated_report = "ERROR"
+
+        results.append({
+            'report': report_text,
+            'generatedreport': generated_report
+        })
+
+    output_df = pd.DataFrame(results)
+    output_df.to_csv(output_csv_path, index=False)
+    print(f"Saved to {output_csv_path}")
+
+
+
+if __name__ == "__main__":
+    csv_path = 'your_csv.csv'  # change this
+    image_folder = 'your_image_folder'  # change this
+    output_csv_path = 'output_reports.csv'
+    HF_TOKEN = 'your_HF_token'  # put your HuggingFace API token here
+
+    process_csv(csv_path, image_folder, output_csv_path, HF_TOKEN)
