@@ -151,4 +151,3 @@ def main_pipeline(image_path, HF_TOKEN):
 
     #print("\nFinal Generated Report:\n", final_report)
     return final_report
-                    
