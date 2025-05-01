@@ -30,7 +30,7 @@ scorer = rouge_scorer.RougeScorer(['rouge1', 'rouge2', 'rougeL'], use_stemmer=Tr
 for _, row in df.iterrows():
     # Get reference and hypothesis texts
     ref_text = row['report']
-    hyp_text = row['retrieved_data']
+    hyp_text = row['genratedreport']
 
     # Tokenize texts
     ref_tokens = nltk.word_tokenize(ref_text.lower())
