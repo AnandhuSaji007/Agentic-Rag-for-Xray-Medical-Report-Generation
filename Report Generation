@@ -1,0 +1,154 @@
+import os
+import torch
+import faiss
+import numpy as np
+from PIL import Image
+from torchvision import transforms, models
+import torch.nn as nn
+from transformers import T5ForConditionalGeneration, BertTokenizer
+from sentence_transformers import SentenceTransformer, util  
+from langchain.llms import HuggingFaceHub  
+
+
+# -------------------------------
+# 1. Define the R2Gen model
+# -------------------------------
+class R2GenModel(torch.nn.Module):
+    def __init__(self, model_name='t5-small', device='cuda', dropout_prob=0.1):
+        super(R2GenModel, self).__init__()
+        self.tokenizer = BertTokenizer.from_pretrained('bert-base-uncased')
+        self.model = T5ForConditionalGeneration.from_pretrained(model_name).to(device)
+        self.device = device
+
+        # Visual extractor: ResNet101 with a modified final layer
+        self.visual_extractor = models.resnet101(pretrained=True).to(device)
+        self.visual_extractor.fc = nn.Linear(self.visual_extractor.fc.in_features, self.model.config.d_model).to(device)
+
+        # Dropout layer for regularization
+        self.dropout = nn.Dropout(dropout_prob)
+
+    def forward(self, input_ids, attention_mask, images, labels=None):
+        visual_features = self.extract_visual_features(images)
+        visual_features = self.dropout(visual_features)  # Apply dropout
+        if labels is not None:
+            return self.model(input_ids=input_ids, attention_mask=attention_mask,
+                              encoder_outputs=(visual_features,), labels=labels)
+        else:
+            return self.model.generate(input_ids=input_ids, attention_mask=attention_mask,
+                                       encoder_outputs=(visual_features,))
+
+    def extract_visual_features(self, images):
+        images = images.to(self.device)
+        visual_features = self.visual_extractor(images)
+        visual_features = visual_features.unsqueeze(1)  # Add sequence dimension
+        batch_size, dim = visual_features.size(0), visual_features.size(2)
+        # Expand to match the expected sequence length (here, 512)
+        visual_features = visual_features.expand(batch_size, 512, dim)
+        return visual_features
+
+    def generate_caption(self, input_ids, images, max_length=50):
+        visual_features = self.extract_visual_features(images)
+        generated_ids = self.model.generate(input_ids=input_ids,
+                                            encoder_outputs=(visual_features,),
+                                            max_length=max_length,
+                                            num_beams=1)
+        generated_texts = [self.tokenizer.decode(g, skip_special_tokens=True, clean_up_tokenization_spaces=True)
+                           for g in generated_ids]
+        return generated_texts
+
+# Set device and load the saved R2Gen model
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+r2gen_model = R2GenModel(model_name='t5-small', device=device)
+r2gen_model.load_state_dict(torch.load('r2gen_model_Bert.pth', map_location=device))
+r2gen_model.to(device)
+r2gen_model.eval()
+
+# Define image transformation (same as used during training)
+image_transform = transforms.Compose([
+    transforms.Resize((224, 224)),
+    transforms.ToTensor(),
+    transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
+])
+
+# -------------------------------
+# 2. Load FAISS index and metadata
+# -------------------------------
+faiss_index = faiss.read_index("faiss_index.bin")
+metadata = np.load("metadata.npy", allow_pickle=True)  # Array of strings (reports)
+text_embedder = SentenceTransformer('all-MiniLM-L6-v2')  # or any other suitable model
+
+
+metadata_embeddings = text_embedder.encode(list(metadata), convert_to_tensor=True)
+
+# -------------------------------
+# 4. Define the retriever agent
+# -------------------------------
+
+def retriever_agent(image_path):
+    # (1) Process image using R2Gen model
+    image = Image.open(image_path).convert('RGB')
+    image_tensor = image_transform(image).unsqueeze(0).to(device)
+
+    prompt = "generate a detailed report by analysing the image: "
+    input_ids = r2gen_model.tokenizer.encode(prompt, return_tensors="pt", max_length=512, truncation=True, padding="max_length").to(device)
+    generated_text = r2gen_model.generate_caption(input_ids, image_tensor, max_length=50)[0]
+
+    # (2) Extract visual features using FAISS-specific extractor (2048-d)
+    with torch.no_grad():
+        visual_feat = faiss_visual_extractor(image_tensor)
+    visual_feat_np = visual_feat.cpu().numpy()
+
+    # (3) Retrieve similar entries using FAISS
+    k = 1  # Retrieve top-1 match
+    distances, indices = faiss_index.search(visual_feat_np, k)
+    visual_sim_score = -distances[0][0]  # Convert distance to similarity
+    retrieved_visual_text = metadata[indices[0][0]]
+
+    # (4) Retrieve similar entries based on text similarity
+    generated_embedding = text_embedder.encode(generated_text, convert_to_tensor=True)
+    cosine_scores = util.cos_sim(generated_embedding, metadata_embeddings)[0]
+    top_result = torch.topk(cosine_scores, k=1)
+    text_sim_score = top_result.values.item()
+    retrieved_text = metadata[top_result.indices.item()]
+
+    print("Visual retrieval:", retrieved_visual_text, "score:", visual_sim_score)
+    print("Text retrieval:", retrieved_text, "score:", text_sim_score)
+
+    # Compute combined similarity score for each index
+    combined_scores = (cosine_scores.cpu().numpy() + (-distances[0])) / 2  # Averaging text and visual similarity
+
+    # Select the index with the highest combined similarity
+    best_index = np.argmax(combined_scores)
+    chosen_data = metadata[best_index]
+
+# -------------------- Report Generation Agent --------------------
+
+def report_generation_agent(r2gen_text, retrieved_data, HF_TOKEN):
+    # Load Zephyr-7B model from Hugging Face
+    
+
+    # Combine the retrieved text with R2Gen output
+    prompt = f"""
+    You are a medical report generation AI. Given the following details:
+
+    1. **R2Gen generated text**: {r2gen_text}
+    2. **Retrieved metadata**: {retrieved_data}
+
+    Generate a medical report combing the both the sources.Make sure no repetition.
+    """
+
+    final_report = llm(prompt)
+    return final_report
+
+# -------------------- Main Pipeline --------------------
+
+def main_pipeline(image_path, HF_TOKEN):
+    # Step 1: Retrieve data using the retriever agent
+    r2gen_text, retrieved_data = retriever_agent(image_path)
+
+    # Step 2: Pass both pieces of information to the report generation agent
+    final_report = report_generation_agent(r2gen_text, retrieved_data, HF_TOKEN)
+
+    #print("\nFinal Generated Report:\n", final_report)
+    return final_report
+                    
